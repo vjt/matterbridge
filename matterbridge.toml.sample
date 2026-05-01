@@ -965,6 +965,20 @@ MessageFormat=""
 #Disables link previews for links in messages
 DisableWebPagePreview=false
 
+#OPTIONAL (default empty)
+#URL of the tg-members-sidecar HTTP service that exposes a real-time TG
+#member list via MTProto. When set, IRC users typing `!tg_users` in a
+#bridged channel will see the list of TG-side members posted back in the
+#channel. Empty disables the feature.
+#  https://github.com/vjt/tg-members-sidecar
+#MembersSidecarURL="http://127.0.0.1:8765"
+
+#OPTIONAL (default empty)
+#Override the chat reference passed to the sidecar. Useful when the
+#matterbridge channel is a numeric chat_id but you'd rather the sidecar
+#resolve by public @username (or vice versa). Empty = pass channel as-is.
+#MembersSidecarChat="@sniffo"
+
 #If enabled use the "First Name" as username. If this is empty use the Username
 #If disabled use the "Username" as username. If this is empty use the First Name
 #If all names are empty, username will be "unknown"
