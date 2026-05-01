@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/42wim/matterbridge/bridge"
@@ -33,6 +34,13 @@ type Birc struct {
 	MessageDelay, MessageQueue, MessageLength int
 	channels                                  map[string]bool
 
+	// userChans tracks which channels each visible nick is in, lowercased
+	// on both axes. Maintained from JOIN/PART/KICK/NICK/QUIT/RPL_NAMREPLY
+	// so that QUIT (which carries no channel) can be fanned out to every
+	// shared channel without racing girc's internal state cleanup.
+	userChans   map[string]map[string]struct{}
+	userChansMu sync.RWMutex
+
 	*bridge.Config
 }
 
@@ -43,6 +51,7 @@ func New(cfg *bridge.Config) bridge.Bridger {
 	b.names = make(map[string][]string)
 	b.connected = make(chan error)
 	b.channels = make(map[string]bool)
+	b.userChans = make(map[string]map[string]struct{})
 
 	if b.GetInt("MessageDelay") == 0 {
 		b.MessageDelay = 1300
@@ -347,6 +356,8 @@ func (b *Birc) endNames(client *girc.Client, event girc.Event) {
 	b.names[channel] = nil
 	b.i.Handlers.Clear(girc.RPL_NAMREPLY)
 	b.i.Handlers.Clear(girc.RPL_ENDOFNAMES)
+	// Re-arm the permanent userChans seeder which Clear above blew away.
+	b.i.Handlers.Add(girc.RPL_NAMREPLY, b.handleNamesReply)
 }
 
 func (b *Birc) skipPrivMsg(event girc.Event) bool {

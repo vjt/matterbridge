@@ -90,6 +90,18 @@ func (b *Birc) handleJoinPart(client *girc.Client, event girc.Event) {
 		return
 	}
 	channel := strings.ToLower(event.Params[0])
+
+	switch event.Command {
+	case "JOIN":
+		b.trackJoin(event.Source.Name, channel)
+	case "PART":
+		b.trackPart(event.Source.Name, channel)
+	case "KICK":
+		if len(event.Params) >= 2 {
+			b.trackPart(event.Params[1], channel)
+		}
+	}
+
 	if event.Command == "KICK" && event.Params[1] == b.Nick {
 		b.Log.Infof("Got kicked from %s by %s", channel, event.Source.Name)
 		time.Sleep(time.Duration(b.GetInt("RejoinDelay")) * time.Second)
@@ -112,9 +124,11 @@ func (b *Birc) handleJoinPart(client *girc.Client, event girc.Event) {
 
 // handleQuit fans out a QUIT event to every bridge-configured channel the
 // quitter shared with us. IRC delivers QUIT once per session with no channel
-// parameter, so without fanout the gateway has no channel to route on and
-// drops the message.
+// parameter, so we use our own nick→channel tracking (see Birc.userChans):
+// girc's internal QUIT handler runs concurrently and clears its own state, so
+// LookupUser there is racy.
 func (b *Birc) handleQuit(client *girc.Client, event girc.Event) {
+	channels := b.trackQuit(event.Source.Name)
 	if event.Source.Name == b.Nick {
 		if strings.Contains(event.Last(), "Ping timeout") {
 			b.Log.Infof("%s reconnecting ..", b.Account)
@@ -125,39 +139,109 @@ func (b *Birc) handleQuit(client *girc.Client, event girc.Event) {
 	if b.GetBool("nosendjoinpart") {
 		return
 	}
-	channels := b.userSharedChannels(client, event.Source.Name)
-	if len(channels) == 0 {
-		b.Log.Debugf("QUIT from %s: no tracked shared channels, dropping", event.Source.Name)
-		return
-	}
-	text := formatJoinLeaveText(event, b.GetBool("verbosejoinpart"))
-	for _, ch := range channels {
-		msg := config.Message{Username: "system", Text: text, Channel: ch, Account: b.Account, Event: config.EventJoinLeave}
-		b.Log.Debugf("<= Sending QUIT JOIN_LEAVE event from %s to gateway for %s", b.Account, ch)
-		b.Log.Debugf("<= Message is %#v", msg)
-		b.Remote <- msg
-	}
-}
-
-// userSharedChannels returns the lowercased names of bridge-configured
-// channels that the given nick is currently in, per girc's tracked state.
-func (b *Birc) userSharedChannels(client *girc.Client, nick string) []string {
-	user := client.LookupUser(nick)
-	if user == nil {
-		return nil
-	}
 	configured := make(map[string]bool, len(b.channels))
 	for ch := range b.channels {
 		configured[strings.ToLower(ch)] = true
 	}
 	var shared []string
-	for _, ch := range user.ChannelList {
-		lc := strings.ToLower(ch)
-		if configured[lc] {
-			shared = append(shared, lc)
+	for _, ch := range channels {
+		if configured[ch] {
+			shared = append(shared, ch)
 		}
 	}
-	return shared
+	if len(shared) == 0 {
+		b.Log.Debugf("QUIT from %s: no tracked shared channels, dropping", event.Source.Name)
+		return
+	}
+	text := formatJoinLeaveText(event, b.GetBool("verbosejoinpart"))
+	for _, ch := range shared {
+		msg := config.Message{Username: "system", Text: text, Channel: ch, Account: b.Account, Event: config.EventJoinLeave}
+		b.Log.Debugf("<= Sending QUIT JOIN_LEAVE event from %s to gateway for %s", b.Account, ch)
+		b.Remote <- msg
+	}
+}
+
+// handleNick updates our tracked nick→channel map when a user changes nick.
+// girc fires this on NICK events; the bridge does not currently relay nick
+// changes to other bridges, but we still need to keep tracking accurate so
+// later QUITs are fanned out to the right channels.
+func (b *Birc) handleNick(client *girc.Client, event girc.Event) {
+	if len(event.Params) < 1 {
+		return
+	}
+	b.trackRename(event.Source.Name, event.Params[0])
+}
+
+// handleNamesReply seeds userChans from the RPL_NAMREPLY (353) burst the
+// server sends right after we join a channel. Without this, users who were
+// already in the channel before us are invisible to the QUIT fanout.
+func (b *Birc) handleNamesReply(client *girc.Client, event girc.Event) {
+	if len(event.Params) < 3 {
+		return
+	}
+	channel := strings.ToLower(event.Params[2])
+	for _, raw := range strings.Fields(event.Last()) {
+		nick := strings.TrimLeft(raw, "@%+&~!")
+		if nick == "" {
+			continue
+		}
+		b.trackJoin(nick, channel)
+	}
+}
+
+func (b *Birc) trackJoin(nick, channel string) {
+	nick = strings.ToLower(nick)
+	b.userChansMu.Lock()
+	defer b.userChansMu.Unlock()
+	chans, ok := b.userChans[nick]
+	if !ok {
+		chans = make(map[string]struct{})
+		b.userChans[nick] = chans
+	}
+	chans[channel] = struct{}{}
+}
+
+func (b *Birc) trackPart(nick, channel string) {
+	nick = strings.ToLower(nick)
+	b.userChansMu.Lock()
+	defer b.userChansMu.Unlock()
+	chans, ok := b.userChans[nick]
+	if !ok {
+		return
+	}
+	delete(chans, channel)
+	if len(chans) == 0 {
+		delete(b.userChans, nick)
+	}
+}
+
+func (b *Birc) trackQuit(nick string) []string {
+	nick = strings.ToLower(nick)
+	b.userChansMu.Lock()
+	defer b.userChansMu.Unlock()
+	chans, ok := b.userChans[nick]
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(chans))
+	for ch := range chans {
+		out = append(out, ch)
+	}
+	delete(b.userChans, nick)
+	return out
+}
+
+func (b *Birc) trackRename(oldNick, newNick string) {
+	oldNick = strings.ToLower(oldNick)
+	newNick = strings.ToLower(newNick)
+	b.userChansMu.Lock()
+	defer b.userChansMu.Unlock()
+	chans, ok := b.userChans[oldNick]
+	if !ok {
+		return
+	}
+	delete(b.userChans, oldNick)
+	b.userChans[newNick] = chans
 }
 
 func (b *Birc) handleNewConnection(client *girc.Client, event girc.Event) {
@@ -174,6 +258,8 @@ func (b *Birc) handleNewConnection(client *girc.Client, event girc.Event) {
 	i.Handlers.Clear("PART")
 	i.Handlers.Clear("QUIT")
 	i.Handlers.Clear("KICK")
+	i.Handlers.Clear("NICK")
+	i.Handlers.Clear(girc.RPL_NAMREPLY)
 	i.Handlers.Clear("INVITE")
 
 	i.Handlers.AddBg("PRIVMSG", b.handlePrivMsg)
@@ -183,6 +269,8 @@ func (b *Birc) handleNewConnection(client *girc.Client, event girc.Event) {
 	i.Handlers.AddBg("PART", b.handleJoinPart)
 	i.Handlers.AddBg("QUIT", b.handleJoinPart)
 	i.Handlers.AddBg("KICK", b.handleJoinPart)
+	i.Handlers.Add("NICK", b.handleNick)
+	i.Handlers.Add(girc.RPL_NAMREPLY, b.handleNamesReply)
 	i.Handlers.Add("INVITE", b.handleInvite)
 }
 
@@ -322,8 +410,8 @@ func (b *Birc) handleTopicWhoTime(client *girc.Client, event girc.Event) {
 }
 
 // formatJoinLeaveText renders a join/part/quit/kick event into a human-readable
-// system message. Special-cases KICK so the kicked nick (and reason, if any)
-// appear instead of just "<kicker> kicks".
+// system message. KICK shows the kicked nick (and reason, if any). PART and
+// QUIT append the user-supplied reason in parentheses when present.
 func formatJoinLeaveText(event girc.Event, verbose bool) string {
 	source := event.Source.Name
 	if verbose && event.Source.Ident != "" {
@@ -336,5 +424,25 @@ func formatJoinLeaveText(event girc.Event, verbose bool) string {
 		}
 		return text
 	}
-	return source + " " + strings.ToLower(event.Command) + "s"
+	text := source + " " + strings.ToLower(event.Command) + "s"
+	if reason := partQuitReason(event); reason != "" {
+		text += " (" + reason + ")"
+	}
+	return text
+}
+
+// partQuitReason extracts the optional reason from a PART or QUIT event,
+// returning "" when absent. PART has [channel, reason]; QUIT has [reason].
+func partQuitReason(event girc.Event) string {
+	switch event.Command {
+	case "PART":
+		if len(event.Params) >= 2 {
+			return event.Last()
+		}
+	case "QUIT":
+		if len(event.Params) >= 1 {
+			return event.Last()
+		}
+	}
+	return ""
 }

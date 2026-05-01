@@ -1,6 +1,7 @@
 package birc
 
 import (
+	"sort"
 	"testing"
 
 	"github.com/lrstanley/girc"
@@ -23,13 +24,23 @@ func TestFormatJoinLeaveText(t *testing.T) {
 			want:  "alice joins",
 		},
 		{
-			name:  "part",
+			name:  "part without reason",
 			event: girc.Event{Source: src("alice", "alice", "host"), Command: "PART", Params: []string{"#chan"}},
 			want:  "alice parts",
 		},
 		{
-			name:  "quit",
+			name:  "part with reason",
+			event: girc.Event{Source: src("alice", "alice", "host"), Command: "PART", Params: []string{"#chan", "see ya"}},
+			want:  "alice parts (see ya)",
+		},
+		{
+			name:  "quit with reason",
 			event: girc.Event{Source: src("alice", "alice", "host"), Command: "QUIT", Params: []string{"Bye"}},
+			want:  "alice quits (Bye)",
+		},
+		{
+			name:  "quit without reason",
+			event: girc.Event{Source: src("alice", "alice", "host"), Command: "QUIT", Params: []string{}},
 			want:  "alice quits",
 		},
 		{
@@ -63,5 +74,65 @@ func TestFormatJoinLeaveText(t *testing.T) {
 				t.Errorf("formatJoinLeaveText() = %q, want %q", got, c.want)
 			}
 		})
+	}
+}
+
+func newTrackingBirc() *Birc {
+	return &Birc{userChans: make(map[string]map[string]struct{})}
+}
+
+func sortedCopy(in []string) []string {
+	out := append([]string(nil), in...)
+	sort.Strings(out)
+	return out
+}
+
+func TestUserChansTracking(t *testing.T) {
+	b := newTrackingBirc()
+
+	b.trackJoin("Alice", "#one")
+	b.trackJoin("alice", "#two")
+	b.trackJoin("BOB", "#one")
+
+	got := sortedCopy(b.trackQuit("ALICE"))
+	want := []string{"#one", "#two"}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("trackQuit(alice) = %v, want %v", got, want)
+	}
+	// Quitter is removed from tracking.
+	if got2 := b.trackQuit("alice"); got2 != nil {
+		t.Errorf("trackQuit(alice) after quit = %v, want nil", got2)
+	}
+
+	// Bob still tracked. PART removes only that channel.
+	b.trackPart("bob", "#one")
+	if got := b.trackQuit("bob"); got != nil {
+		t.Errorf("trackQuit(bob) after final part = %v, want nil (purged)", got)
+	}
+
+	// Rename carries channel set across.
+	b.trackJoin("carol", "#one")
+	b.trackRename("CAROL", "Caroline")
+	if got := b.trackQuit("carol"); got != nil {
+		t.Errorf("trackQuit(carol) after rename = %v, want nil", got)
+	}
+	if got := b.trackQuit("caroline"); len(got) != 1 || got[0] != "#one" {
+		t.Errorf("trackQuit(caroline) = %v, want [#one]", got)
+	}
+}
+
+func TestHandleNamesReplySeed(t *testing.T) {
+	b := newTrackingBirc()
+	event := girc.Event{
+		Command: girc.RPL_NAMREPLY,
+		Params:  []string{"Bot", "=", "#chan", "@op +voiced regular ~founder"},
+	}
+	b.handleNamesReply(nil, event)
+
+	for _, nick := range []string{"op", "voiced", "regular", "founder"} {
+		got := b.trackQuit(nick)
+		if len(got) != 1 || got[0] != "#chan" {
+			t.Errorf("trackQuit(%s) = %v, want [#chan]", nick, got)
+		}
 	}
 }
