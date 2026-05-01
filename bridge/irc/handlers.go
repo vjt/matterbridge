@@ -81,6 +81,10 @@ func (b *Birc) handleInvite(client *girc.Client, event girc.Event) {
 }
 
 func (b *Birc) handleJoinPart(client *girc.Client, event girc.Event) {
+	if event.Command == "QUIT" {
+		b.handleQuit(client, event)
+		return
+	}
 	if len(event.Params) == 0 {
 		b.Log.Debugf("handleJoinPart: empty Params? %#v", event)
 		return
@@ -91,13 +95,6 @@ func (b *Birc) handleJoinPart(client *girc.Client, event girc.Event) {
 		time.Sleep(time.Duration(b.GetInt("RejoinDelay")) * time.Second)
 		b.Remote <- config.Message{Username: "system", Text: "rejoin", Channel: channel, Account: b.Account, Event: config.EventRejoinChannels}
 		return
-	}
-	if event.Command == "QUIT" {
-		if event.Source.Name == b.Nick && strings.Contains(event.Last(), "Ping timeout") {
-			b.Log.Infof("%s reconnecting ..", b.Account)
-			b.Remote <- config.Message{Username: "system", Text: "reconnect", Channel: channel, Account: b.Account, Event: config.EventFailure}
-			return
-		}
 	}
 	if event.Source.Name != b.Nick {
 		if b.GetBool("nosendjoinpart") {
@@ -111,6 +108,56 @@ func (b *Birc) handleJoinPart(client *girc.Client, event girc.Event) {
 		return
 	}
 	b.Log.Debugf("handle %#v", event)
+}
+
+// handleQuit fans out a QUIT event to every bridge-configured channel the
+// quitter shared with us. IRC delivers QUIT once per session with no channel
+// parameter, so without fanout the gateway has no channel to route on and
+// drops the message.
+func (b *Birc) handleQuit(client *girc.Client, event girc.Event) {
+	if event.Source.Name == b.Nick {
+		if strings.Contains(event.Last(), "Ping timeout") {
+			b.Log.Infof("%s reconnecting ..", b.Account)
+			b.Remote <- config.Message{Username: "system", Text: "reconnect", Channel: "", Account: b.Account, Event: config.EventFailure}
+		}
+		return
+	}
+	if b.GetBool("nosendjoinpart") {
+		return
+	}
+	channels := b.userSharedChannels(client, event.Source.Name)
+	if len(channels) == 0 {
+		b.Log.Debugf("QUIT from %s: no tracked shared channels, dropping", event.Source.Name)
+		return
+	}
+	text := formatJoinLeaveText(event, b.GetBool("verbosejoinpart"))
+	for _, ch := range channels {
+		msg := config.Message{Username: "system", Text: text, Channel: ch, Account: b.Account, Event: config.EventJoinLeave}
+		b.Log.Debugf("<= Sending QUIT JOIN_LEAVE event from %s to gateway for %s", b.Account, ch)
+		b.Log.Debugf("<= Message is %#v", msg)
+		b.Remote <- msg
+	}
+}
+
+// userSharedChannels returns the lowercased names of bridge-configured
+// channels that the given nick is currently in, per girc's tracked state.
+func (b *Birc) userSharedChannels(client *girc.Client, nick string) []string {
+	user := client.LookupUser(nick)
+	if user == nil {
+		return nil
+	}
+	configured := make(map[string]bool, len(b.channels))
+	for ch := range b.channels {
+		configured[strings.ToLower(ch)] = true
+	}
+	var shared []string
+	for _, ch := range user.ChannelList {
+		lc := strings.ToLower(ch)
+		if configured[lc] {
+			shared = append(shared, lc)
+		}
+	}
+	return shared
 }
 
 func (b *Birc) handleNewConnection(client *girc.Client, event girc.Event) {
